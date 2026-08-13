@@ -547,6 +547,45 @@ describe('markdown stream startup failures', () => {
     expect(visibleProgress.some((m) => m.includes('过程文本最终答案'))).toBe(true);
     expect(h.channel.sent).toHaveLength(0);
   });
+
+  it('mimo: dedupes even when tool calls split the text into separate stream blocks', async () => {
+    // Real mimo runs emit text before and after a tool call (e.g. image
+    // analysis): the stream renders two blocks joined with "\n\n", while
+    // final_text joins the raw parts without a separator. The dedup must
+    // compare whitespace-normalized text so the conclusion is not posted twice.
+    const visibleProgress: string[] = [];
+    const h = await createHarness({
+      agentKind: 'mimo',
+      events: [
+        { type: 'text', delta: '开始分析图片' },
+        { type: 'tool_use', id: 'v1', name: 'vision_analyze_local', input: {} },
+        { type: 'tool_result', id: 'v1', output: 'ok', isError: false },
+        { type: 'text', delta: '结论：图片显示完整' },
+        // mimo final_text = join('') of all text parts, no separator.
+        { type: 'final_text', content: '开始分析图片结论：图片显示完整' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        await producer?.({
+          setContent: vi.fn(async (markdown: string) => {
+            visibleProgress.push(markdown);
+          }),
+        });
+      },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_mimo_tool_dedup', 'run'));
+    // Stream renders both blocks (joined with \n\n); final_text joins raw.
+    await waitFor(() => visibleProgress.some((m) => m.includes('结论：图片显示完整')));
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    // Whitespace-normalized dedup means no standalone reply.
+    expect(h.channel.sent).toHaveLength(0);
+  });
 });
 
 async function createHarness(options: {

@@ -1248,8 +1248,20 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           latestState = state;
           if (shouldOpenProgressStream(filterForPrefs(state), progressRender)) progress.ensureOpen();
           if (markdownCtrl) {
-            lastStreamedText = progressRender(filterForPrefs(state));
-            await markdownCtrl.setContent(lastStreamedText);
+            // Record the streamed text-only view (text blocks joined, tool
+            // lines excluded) so the dedup below can tell whether the
+            // conclusion already streamed: tool lines interleaved between
+            // text blocks would otherwise break the substring match. Note:
+            // use the raw blocks, NOT finalAnswerOnlyState (which collapses
+            // to finalText when present).
+            lastStreamedText = renderText({
+              ...filterForPrefs(state),
+              blocks: filterForPrefs(state).blocks.filter((b) => b.kind === 'text'),
+              reasoning: { content: '', active: false },
+              footer: null,
+              terminal: 'done',
+            });
+            await markdownCtrl.setContent(progressRender(filterForPrefs(state)));
           }
         },
       );
@@ -1280,13 +1292,18 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       // rendered; skip the standalone reply in that case to avoid posting the
       // same conclusion twice. If the stream never showed the text (it failed
       // or was abandoned), lastStreamedText won't contain it and we still send.
+      //
+      // Whitespace-normalized comparison: stream blocks are joined with \n\n
+      // while final_text joins raw parts, so strip all whitespace before the
+      // substring check — the text itself is what must not be duplicated.
       const finalState = filterForPrefs(latestState);
       const finalReply = finalReplyState(progress, finalState);
       const finalReplyText = renderText(finalReply).trim();
+      const normalize = (s: string): string => s.replace(/\s+/g, '');
       if (
         finalReplyText &&
         lastStreamedText &&
-        lastStreamedText.includes(finalReplyText)
+        normalize(lastStreamedText).includes(normalize(finalReplyText))
       ) {
         log.info('outbound', 'final-reply-skipped', {
           scope,
