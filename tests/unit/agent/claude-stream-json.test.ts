@@ -100,6 +100,51 @@ describe('Claude stream-json translator', () => {
     expect([...translateEvent({ type: 'result', session_id: 'sess-2' })][0]).not.toHaveProperty('threadId');
   });
 
+  it('streams token-level text_delta deltas live, then buffers the full block as final_text', () => {
+    // --include-partial-messages emits content_block_delta (text_delta) tokens
+    // before the full assistant block. Deltas must stream as `text` events
+    // immediately; the full block must not be re-emitted (it would duplicate).
+    const translate = createTranslateEvent();
+    const deltas = [
+      translate.translate({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: '你好' } },
+      }),
+      translate.translate({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: '世界' } },
+      }),
+    ];
+    expect(deltas).toEqual([
+      [{ type: 'text', delta: '你好' }],
+      [{ type: 'text', delta: '世界' }],
+    ]);
+
+    // Full assistant block arrives after deltas: buffer it for final_text,
+    // do not stream it again.
+    const full = translate.translate({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: '你好世界' }] },
+    });
+    expect(full).toEqual([]);
+
+    const final = translate.translate({ type: 'result', session_id: 'sess-stream' });
+    expect(final).toEqual([
+      { type: 'final_text', content: '你好世界' },
+      { type: 'done', sessionId: 'sess-stream', terminationReason: 'normal' },
+    ]);
+  });
+
+  it('streams thinking_delta deltas live', () => {
+    const translate = createTranslateEvent();
+    expect(
+      translate.translate({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: '想' } },
+      }),
+    ).toEqual([{ type: 'thinking', delta: '想' }]);
+  });
+
   it('ignores unknown, empty, and incomplete raw events', () => {
     expect([...translateEvent(null)]).toEqual([]);
     expect([...translateEvent({ type: 'assistant', message: { content: [{ type: 'text', text: '' }] } })]).toEqual([]);

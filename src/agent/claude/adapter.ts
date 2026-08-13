@@ -75,6 +75,9 @@ export class ClaudeAdapter implements AgentAdapter {
       '--output-format',
       'stream-json',
       '--verbose',
+      // Real-time token deltas (stream_event/content_block_delta) so the reply
+      // can type out live instead of arriving as one big block at the end.
+      '--include-partial-messages',
       '--permission-mode',
       opts.permissionMode ?? CLAUDE_DEFAULT_PERMISSION_MODE,
       '--append-system-prompt-file',

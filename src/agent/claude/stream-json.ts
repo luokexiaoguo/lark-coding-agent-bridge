@@ -19,6 +19,12 @@ interface ClaudeRawEvent {
   cwd?: string;
   model?: string;
   message?: { content?: ContentBlock[] };
+  event?: {
+    type?: string;
+    index?: number;
+    delta?: { type?: string; text?: string; thinking?: string };
+    content_block?: { type?: string; text?: string; thinking?: string };
+  };
   usage?: {
     input_tokens?: number;
     output_tokens?: number;
@@ -41,20 +47,21 @@ export interface ClaudeEventTranslator {
 /**
  * Stateful translator for claude's `stream-json` output.
  *
- * Claude emits each assistant turn as one event whose text block is the full
- * reply for that turn. Mid-run turns are progress commentary; the final turn
- * (the one just before `result`) is the answer. We buffer the most recent
- * text so that when `result` arrives we know the last text block is the
- * conclusion and emit it as `final_text` — mirroring codex/mimo — while
- * everything before it streams as regular `text` (progress the user can read
- * while tools run).
+ * With `--include-partial-messages`, claude emits real-time token deltas as
+ * `stream_event`/`content_block_delta` (`text_delta`/`thinking_delta`) before
+ * the full `assistant` message. We forward those deltas as streaming `text` /
+ * `thinking` events so the reply types out live in Feishu, and buffer the
+ * final `assistant` text block as `final_text` (result) for the standalone
+ * conclusion reply — mirroring codex/mimo.
  *
- * A single assistant message may carry several text blocks; we join them so
- * none is dropped. Mid-run commentary is flushed as `text` the moment a tool
- * call appears in a later turn (a tool call ends the commentary turn).
+ * Without partial messages (older CLI), assistant text blocks arrive whole;
+ * the first one streams as progress text, the last (before `result`) becomes
+ * `final_text`. A single assistant message may carry several text blocks; we
+ * join them so none is dropped.
  */
 export function createTranslateEvent(): ClaudeEventTranslator {
   let pendingText: string | undefined;
+  let streamingText = false;
 
   const flushPending = (events: AgentEvent[], asFinal: boolean): void => {
     if (pendingText === undefined) return;
@@ -82,10 +89,29 @@ export function createTranslateEvent(): ClaudeEventTranslator {
         return events;
       }
 
+      // Token-level streaming deltas from --include-partial-messages.
+      if (evt.type === 'stream_event' && evt.event?.type === 'content_block_delta') {
+        const delta = evt.event.delta;
+        if (delta?.type === 'text_delta' && delta.text) {
+          streamingText = true;
+          events.push({ type: 'text', delta: delta.text });
+        } else if (delta?.type === 'thinking_delta' && delta.thinking) {
+          events.push({ type: 'thinking', delta: delta.thinking });
+        }
+        return events;
+      }
+
       if (evt.type === 'assistant' && evt.message?.content) {
         let sawToolUse = false;
         for (const block of evt.message.content) {
           if (block.type === 'text' && typeof block.text === 'string' && block.text) {
+            if (streamingText) {
+              // Full block already streamed via deltas; just buffer for the
+              // final reply. (Next turn resets the flag.)
+              pendingText = block.text;
+              streamingText = false;
+              continue;
+            }
             // A text block that follows a tool_use in the same message is a new
             // turn's commentary; flush any buffered text as progress first.
             if (sawToolUse && pendingText !== undefined) {
@@ -103,7 +129,9 @@ export function createTranslateEvent(): ClaudeEventTranslator {
           } else if (block.type === 'tool_use' && block.id && block.name) {
             sawToolUse = true;
             // A tool call ends the commentary turn: its text is progress, not
-            // the answer.
+            // the answer. Any deltas seen so far belong to the previous block,
+            // so the next text (same message or later turn) starts fresh.
+            streamingText = false;
             flushPending(events, false);
             events.push({
               type: 'tool_use',
