@@ -62,6 +62,10 @@ export interface ClaudeEventTranslator {
 export function createTranslateEvent(): ClaudeEventTranslator {
   let pendingText: string | undefined;
   let streamingText = false;
+  /** Final-answer candidate captured from an assistant block whose content was
+   * already streamed via deltas. Emitted as final_text on result; never flushed
+   * as progress text. */
+  let finalCandidate: string | undefined;
 
   const flushPending = (events: AgentEvent[], asFinal: boolean): void => {
     if (pendingText === undefined) return;
@@ -94,6 +98,10 @@ export function createTranslateEvent(): ClaudeEventTranslator {
         const delta = evt.event.delta;
         if (delta?.type === 'text_delta' && delta.text) {
           streamingText = true;
+          // The delta itself is the streamed text; a later assistant block with
+          // the same content must not be re-emitted. Track the accumulated
+          // delta text so tool_use/assistant knows what was already shown.
+          
           events.push({ type: 'text', delta: delta.text });
         } else if (delta?.type === 'thinking_delta' && delta.thinking) {
           events.push({ type: 'thinking', delta: delta.thinking });
@@ -106,10 +114,11 @@ export function createTranslateEvent(): ClaudeEventTranslator {
         for (const block of evt.message.content) {
           if (block.type === 'text' && typeof block.text === 'string' && block.text) {
             if (streamingText) {
-              // Full block already streamed via deltas; just buffer for the
-              // final reply. (Next turn resets the flag.)
-              pendingText = block.text;
-              streamingText = false;
+              // This block's content was already emitted as stream deltas.
+              // Keep it only as the final-answer candidate (result → final_text);
+              // never re-emit or flush it as progress text.
+              finalCandidate = block.text;
+              
               continue;
             }
             // A text block that follows a tool_use in the same message is a new
@@ -128,11 +137,14 @@ export function createTranslateEvent(): ClaudeEventTranslator {
             events.push({ type: 'thinking', delta: block.thinking });
           } else if (block.type === 'tool_use' && block.id && block.name) {
             sawToolUse = true;
-            // A tool call ends the commentary turn: its text is progress, not
-            // the answer. Any deltas seen so far belong to the previous block,
-            // so the next text (same message or later turn) starts fresh.
+            // A tool call ends the commentary turn. If the preceding text was
+            // already streamed via deltas, it is held in finalCandidate (not
+            // to be re-emitted); otherwise flush any buffered text as progress.
+            if (!streamingText && pendingText !== undefined) {
+              flushPending(events, false);
+            }
             streamingText = false;
-            flushPending(events, false);
+            
             events.push({
               type: 'tool_use',
               id: block.id,
@@ -161,8 +173,15 @@ export function createTranslateEvent(): ClaudeEventTranslator {
       }
 
       if (evt.type === 'result') {
-        // Whatever text is still buffered is the final answer.
-        flushPending(events, true);
+        // Streaming mode: the answer was already shown via deltas; emit its
+        // final candidate. Non-streaming mode: whatever text is still buffered
+        // is the final answer.
+        if (finalCandidate !== undefined) {
+          events.push({ type: 'final_text', content: finalCandidate });
+          finalCandidate = undefined;
+        } else {
+          flushPending(events, true);
+        }
         if (evt.usage) {
           events.push({
             type: 'usage',

@@ -135,6 +135,36 @@ describe('Claude stream-json translator', () => {
     ]);
   });
 
+  it('does not re-emit streamed text when tool calls split turns (regression: duplicate replies)', () => {
+    // Real long runs emit delta-text → full assistant block → tool_use →
+    // delta-text → full assistant block → … The full blocks whose content was
+    // already streamed as deltas must not be re-emitted as progress text, and
+    // tool_use must not flush them either (that posted every sentence twice).
+    const translate = createTranslateEvent();
+    const all: Array<{ type: string; delta?: string; content?: string }> = [];
+    const feed = (raw: unknown): void => {
+      all.push(...(translate.translate(raw) as Array<{ type: string; delta?: string; content?: string }>));
+    };
+
+    feed({ type: 'stream_event', event: { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: '需求明确' } } });
+    feed({ type: 'assistant', message: { content: [{ type: 'text', text: '需求明确' }] } });
+    feed({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: {} }] } });
+    feed({ type: 'stream_event', event: { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: '检查环境' } } });
+    feed({ type: 'assistant', message: { content: [{ type: 'text', text: '检查环境' }] } });
+    feed({ type: 'result', session_id: 'sess-dup' });
+
+    const texts = all.filter((e) => e.type === 'text').map((e) => e.delta ?? '');
+    expect(texts).toEqual(['需求明确', '检查环境']);
+
+    const finals = all.filter((e) => e.type === 'final_text').map((e) => e.content ?? '');
+    expect(finals).toEqual(['检查环境']);
+
+    // No duplicated sentence.
+    const counts = new Map<string, number>();
+    for (const t of texts) counts.set(t, (counts.get(t) ?? 0) + 1);
+    expect([...counts.values()].every((c) => c === 1)).toBe(true);
+  });
+
   it('streams thinking_delta deltas live', () => {
     const translate = createTranslateEvent();
     expect(
