@@ -263,14 +263,14 @@ describe('markdown stream startup failures', () => {
   });
 
   it('does not open a progress stream for a text-only claude reply, sending it directly', async () => {
-    // Claude's markdown stream renders tool progress only; a text-only round
-    // (no tool calls) never opens a stream and the answer goes out as a plain
-    // message via the fallback — same shape as the codex final-only round.
+    // Claude's adapter now emits `final_text` (like codex/mimo): a text-only
+    // round produces no process text, never opens a stream, and the answer
+    // goes out as a plain message — same shape as the codex final-only round.
     const visibleProgress: string[] = [];
     const h = await createHarness({
       agentKind: 'claude',
       events: [
-        { type: 'text', delta: 'ANSWER_ONCE' },
+        { type: 'final_text', content: 'ANSWER_ONCE' },
         { type: 'done', terminationReason: 'normal' },
       ],
       stream: async (_chatId, input) => {
@@ -430,20 +430,20 @@ describe('markdown stream startup failures', () => {
 
   it('claude: streams tool progress and still delivers the final reply when the stream update fails', async () => {
     // The regression this guards: a claude run with many tool calls streams
-    // each tool line into a markdown message, and the conclusion was carried
-    // by that same stream's last update. If the SDK's updateCardElementContent
-    // silently fails (e.g. DNS errors), the message froze on "正在调用工具..."
-    // and the answer never appeared. The final reply must be delivered as a
-    // standalone message regardless of stream health.
+    // progress text + tool lines into a markdown message, and the conclusion
+    // (final_text) is delivered as a standalone reply — independent of stream
+    // update health. If the SDK's updateCardElementContent silently fails
+    // (e.g. DNS errors), the conclusion must still arrive.
     const visibleProgress: string[] = [];
     const h = await createHarness({
       agentKind: 'claude',
       events: [
+        { type: 'text', delta: '开始处理' },
         { type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'git status' } },
         { type: 'tool_result', id: 't1', output: 'ok', isError: false },
         { type: 'tool_use', id: 't2', name: 'Read', input: { path: 'src/x.ts' } },
         { type: 'tool_result', id: 't2', output: 'file', isError: false },
-        { type: 'text', delta: '结论：这就是答案' },
+        { type: 'final_text', content: '结论：这就是答案' },
         { type: 'done', terminationReason: 'normal' },
       ],
       stream: async (_chatId, input) => {
@@ -462,8 +462,10 @@ describe('markdown stream startup failures', () => {
     await h.channel.handlers.message?.(message('om_claude_tools', 'run'));
     await waitFor(() => h.channel.sent.length === 1);
 
-    // Stream carries the tool activity but never the final text.
+    // Stream carries tool activity and progress text, but never the final
+    // answer.
     expect(visibleProgress.some((markdown) => markdown.includes('Bash'))).toBe(true);
+    expect(visibleProgress.some((markdown) => markdown.includes('开始处理'))).toBe(true);
     expect(visibleProgress.some((markdown) => markdown.includes('结论'))).toBe(false);
     // The conclusion arrives as its own message.
     expect(h.channel.sent).toHaveLength(1);

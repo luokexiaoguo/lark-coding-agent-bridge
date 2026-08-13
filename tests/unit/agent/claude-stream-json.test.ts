@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ClaudeAdapter } from '../../../src/agent/claude/adapter.js';
-import { translateEvent } from '../../../src/agent/claude/stream-json.js';
+import { createTranslateEvent, translateEvent } from '../../../src/agent/claude/stream-json.js';
 import type { AgentEvent } from '../../../src/agent/types.js';
 
 describe('Claude stream-json translator', () => {
@@ -23,6 +23,8 @@ describe('Claude stream-json translator', () => {
   });
 
   it('translates assistant text, thinking, and tool_use blocks in order', () => {
+    // Text is buffered; a tool_use in the same message flushes it as progress
+    // before the tool call, so order is thinking → text → tool_use.
     expect([
       ...translateEvent({
         type: 'assistant',
@@ -35,9 +37,24 @@ describe('Claude stream-json translator', () => {
         },
       }),
     ]).toEqual([
-      { type: 'text', delta: 'hello' },
       { type: 'thinking', delta: 'checking' },
+      { type: 'text', delta: 'hello' },
       { type: 'tool_use', id: 'tool-1', name: 'Bash', input: { command: 'pwd' } },
+    ]);
+  });
+
+  it('emits the last buffered text as final_text on result', () => {
+    const translate = createTranslateEvent();
+    expect(translate.translate({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'final answer' }] },
+    })).toEqual([]);
+    expect(translate.translate({
+      type: 'result',
+      session_id: 'sess-final',
+    })).toEqual([
+      { type: 'final_text', content: 'final answer' },
+      { type: 'done', sessionId: 'sess-final', terminationReason: 'normal' },
     ]);
   });
 

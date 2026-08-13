@@ -102,7 +102,7 @@ describe('topic message quote handling', () => {
     const h = await createHarness({
       chatMode: 'group',
       agentEvents: [
-        { type: 'text', delta: '好的' },
+        { type: 'final_text', content: '好的' },
         { type: 'done', terminationReason: 'normal' },
       ],
     });
@@ -142,7 +142,7 @@ describe('topic message quote handling', () => {
       chatMode: 'topic',
       rawThreadIds: { om_topic_start: 'omt_backfilled' },
       agentEvents: [
-        { type: 'text', delta: '好的' },
+        { type: 'final_text', content: '好的' },
         { type: 'done', terminationReason: 'normal' },
       ],
     });
@@ -177,7 +177,7 @@ describe('topic message quote handling', () => {
     const h = await createHarness({
       chatMode: 'topic',
       agentEvents: [
-        { type: 'text', delta: '好的' },
+        { type: 'final_text', content: '好的' },
         { type: 'done', terminationReason: 'normal' },
       ],
     });
@@ -320,7 +320,7 @@ describe('topic message quote handling', () => {
     const h = await createHarness({
       chatMode: 'group',
       agentEvents: [
-        { type: 'text', delta: '这是真正的回答' },
+        { type: 'final_text', content: '这是真正的回答' },
         { type: 'done', terminationReason: 'normal' },
       ],
     });
