@@ -262,10 +262,10 @@ describe('markdown stream startup failures', () => {
     expect(h.channel.sent).toHaveLength(0);
   });
 
-  it('waits for a slow-opening progress stream instead of replying alongside it', async () => {
-    // Opening a streaming card costs two API round trips. When the run finishes
-    // first, replying right away duplicates the answer verbatim — once as text,
-    // once as the card that lands a moment later.
+  it('does not open a progress stream for a text-only claude reply, sending it directly', async () => {
+    // Claude's markdown stream renders tool progress only; a text-only round
+    // (no tool calls) never opens a stream and the answer goes out as a plain
+    // message via the fallback — same shape as the codex final-only round.
     const visibleProgress: string[] = [];
     const h = await createHarness({
       agentKind: 'claude',
@@ -288,10 +288,10 @@ describe('markdown stream startup failures', () => {
     await startTestBridge(h);
 
     await h.channel.handlers.message?.(message('om_slow_stream', 'run'));
-    await waitFor(() => visibleProgress.some((markdown) => markdown.includes('ANSWER_ONCE')));
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    await waitFor(() => h.channel.sent.length === 1, 4000);
 
-    expect(h.channel.sent).toHaveLength(0);
+    expect(visibleProgress).toHaveLength(0);
+    expect(lastMarkdown(h.channel)).toContain('ANSWER_ONCE');
   });
 
   it('renders nothing in a progress stream it already gave up on', async () => {
@@ -427,6 +427,86 @@ describe('markdown stream startup failures', () => {
     expect(finalJson).not.toContain('progress update');
     expect(h.channel.sent[0]?.options).toMatchObject({ replyTo: 'om_card_final' });
   });
+
+  it('claude: streams tool progress and still delivers the final reply when the stream update fails', async () => {
+    // The regression this guards: a claude run with many tool calls streams
+    // each tool line into a markdown message, and the conclusion was carried
+    // by that same stream's last update. If the SDK's updateCardElementContent
+    // silently fails (e.g. DNS errors), the message froze on "正在调用工具..."
+    // and the answer never appeared. The final reply must be delivered as a
+    // standalone message regardless of stream health.
+    const visibleProgress: string[] = [];
+    const h = await createHarness({
+      agentKind: 'claude',
+      events: [
+        { type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'git status' } },
+        { type: 'tool_result', id: 't1', output: 'ok', isError: false },
+        { type: 'tool_use', id: 't2', name: 'Read', input: { path: 'src/x.ts' } },
+        { type: 'tool_result', id: 't2', output: 'file', isError: false },
+        { type: 'text', delta: '结论：这就是答案' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        await producer?.({
+          setContent: vi.fn(async (markdown: string) => {
+            visibleProgress.push(markdown);
+          }),
+        });
+      },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_claude_tools', 'run'));
+    await waitFor(() => h.channel.sent.length === 1);
+
+    // Stream carries the tool activity but never the final text.
+    expect(visibleProgress.some((markdown) => markdown.includes('Bash'))).toBe(true);
+    expect(visibleProgress.some((markdown) => markdown.includes('结论'))).toBe(false);
+    // The conclusion arrives as its own message.
+    expect(h.channel.sent).toHaveLength(1);
+    expect(lastMarkdown(h.channel)).toContain('结论：这就是答案');
+  });
+
+  it('mimo: delivers the final_text answer as a standalone reply even when the stream fails', async () => {
+    // mimo (like codex) holds its answer in `final_text`; before the fix its
+    // dedicated final reply was gated on `agentKind === 'codex'`, so a mimo
+    // stream failure froze the message on tool progress with no conclusion.
+    const fail = vi.spyOn(log, 'fail').mockImplementation(() => {});
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const h = await createHarness({
+      agentKind: 'mimo',
+      events: [
+        { type: 'tool_use', id: 'm1', name: 'Bash', input: { command: 'ls' } },
+        { type: 'tool_result', id: 'm1', output: 'ok', isError: false },
+        { type: 'text', delta: '过程文本' },
+        { type: 'final_text', content: 'MIMO_FINAL' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        await producer?.({ setContent: vi.fn(async () => {}) });
+        throw new Error('mimo stream failed');
+      },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_mimo_final', 'run'));
+    await waitFor(() => h.channel.sent.length === 1);
+
+    expect(lastMarkdown(h.channel)).toContain('MIMO_FINAL');
+    // The stream error is surfaced (fail for codex, warn for claude/mimo),
+    // never silently swallowed — but the conclusion must still reach the user.
+    expect(
+      warn.mock.calls.some(
+        (call) => call[0] === 'stream' && call[1] === 'final-reply-after-stream-error',
+      ),
+    ).toBe(true);
+  });
 });
 
 async function createHarness(options: {
@@ -437,7 +517,7 @@ async function createHarness(options: {
   events?: FakeAgentEvents;
   messageReply?: 'card' | 'markdown' | 'text';
   /** Codex holds its answer back for a dedicated final reply; Claude streams it. */
-  agentKind?: 'claude' | 'codex';
+  agentKind?: 'claude' | 'codex' | 'mimo';
 } = {}): Promise<{
   tmp: TmpProfile;
   channel: FakeLarkChannel;
@@ -464,6 +544,7 @@ async function createHarness(options: {
     codex: {
       binaryPath: '/usr/local/bin/codex',
     },
+    ...(options.agentKind === 'mimo' ? { mimo: { binaryPath: '/usr/local/bin/mimo' } } : {}),
     ...(options.messageReply ? { preferences: { messageReply: options.messageReply } } : {}),
   });
   const profileConfig = {

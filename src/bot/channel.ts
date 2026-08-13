@@ -5,7 +5,7 @@ import type {
 } from '@larksuite/channel';
 import { createLarkChannel } from '@larksuite/channel';
 import { dirname, join } from 'node:path';
-import { claudeCapability, codexCapability } from '../agent/capability';
+import { claudeCapability, codexCapability, mimoCapability } from '../agent/capability';
 import { modelLabel, normalizeModelSelection, resolveModelArg } from '../agent/models';
 import {
   buildAgentPrompt,
@@ -27,7 +27,7 @@ import {
   reduce,
   type RunState,
 } from '../card/run-state';
-import { renderText } from '../card/text-renderer';
+import { renderText, renderToolProgress } from '../card/text-renderer';
 import { tryHandleCommand, type Controls } from '../commands';
 import type { AppConfig } from '../config/schema';
 import {
@@ -958,7 +958,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const capability =
     controls.profileConfig.agentKind === 'codex'
       ? codexCapability(controls.profileConfig)
-      : claudeCapability(controls.profileConfig);
+      : controls.profileConfig.agentKind === 'mimo'
+        ? mimoCapability(controls.profileConfig)
+        : claudeCapability(controls.profileConfig);
   const flow = await startRunFlow({
     scopeId: scope,
     scope: scopeContext,
@@ -1179,10 +1181,16 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           },
         });
       } catch (err) {
-        if (controls.profileConfig.agentKind !== 'codex') throw err;
+        // Stream failure must not skip the dedicated final reply (claude/mimo
+        // fall back to it; codex logs and continues too). Rethrowing here would
+        // drop the conclusion for claude/mimo.
         log.fail('stream', err, { mode: replyMode, step: 'progress-stream' });
       }
       await recallIfEmptyStreamedReply(channel, progress, filterForPrefs(latestState), scope);
+      // The final reply must reach the user even if the stream's last update
+      // failed. codex holds it in final_text (finalReplyState); claude/mimo
+      // fall back to the full state as a standalone card, but only when the
+      // stream actually opened and wasn't abandoned (else fallback sent it).
       if (controls.profileConfig.agentKind === 'codex') {
         await sendFinalReply({
           channel,
@@ -1193,8 +1201,29 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           sendOpts,
           cardRenderOptions,
         });
+      } else if (progress.opened() && !progress.abandoned()) {
+        await sendFinalReply({
+          channel,
+          chatId,
+          scope,
+          state: finalAnswerOnlyState(filterForPrefs(latestState)),
+          replyMode,
+          sendOpts,
+          cardRenderOptions,
+        });
       }
     } else if (replyMode === 'markdown') {
+      // Reply delivery differs by agent:
+      //  - codex & mimo stream their process text and hold the answer in
+      //    `final_text`; the dedicated final reply is the only copy of the
+      //    conclusion, so it must always go out (a stream update failure must
+      //    never swallow it — the "stuck on 正在调用工具" symptom).
+      //  - claude has no `final_text`; its answer lives in the stream's text
+      //    blocks. The stream renders tool progress only and the conclusion is
+      //    posted as a standalone message instead.
+      const isCodexLike = controls.profileConfig.agentKind !== 'claude';
+      const progressRender = (state: RunState): string =>
+        isCodexLike ? renderText(state) : renderToolProgress(state);
       let latestState: RunState = initialState;
       let producerStarted = false;
       let markdownCtrl: { setContent(markdown: string): Promise<void> } | undefined;
@@ -1206,7 +1235,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
               producerStarted = true;
               if (progress.abandoned()) return;
               markdownCtrl = ctrl;
-              await ctrl.setContent(renderText(filterForPrefs(latestState)));
+              await ctrl.setContent(progressRender(filterForPrefs(latestState)));
               await renderDone;
             },
           },
@@ -1221,9 +1250,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         recordSession,
         async (state) => {
           latestState = state;
-          if (shouldOpenProgressStream(filterForPrefs(state))) progress.ensureOpen();
+          if (shouldOpenProgressStream(filterForPrefs(state), progressRender)) progress.ensureOpen();
           if (markdownCtrl) {
-            await markdownCtrl.setContent(renderText(filterForPrefs(state)));
+            await markdownCtrl.setContent(progressRender(filterForPrefs(state)));
           }
         },
       );
@@ -1234,24 +1263,47 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           renderDone,
           producerStarted: () => producerStarted,
           fallback: async (state) => {
-            if (controls.profileConfig.agentKind === 'codex') return;
-            const body = renderText(filterForPrefs(state));
-            if (body.trim()) {
-              await channel.send(chatId, { markdown: body }, sendOpts);
+            if (!isCodexLike) {
+              const body = renderText(filterForPrefs(state));
+              if (body.trim()) {
+                await channel.send(chatId, { markdown: body }, sendOpts);
+              }
             }
           },
         });
       } catch (err) {
-        if (controls.profileConfig.agentKind !== 'codex') throw err;
-        log.fail('stream', err, { mode: replyMode, step: 'progress-stream' });
+        // A stream that failed before producing anything already fell back to a
+        // direct reply inside `awaitRenderAwareStream`; one that failed after
+        // the producer started rethrows so codex can decide — but for
+        // claude/mimo a throw here would skip the dedicated final reply and
+        // drop the conclusion. Log and continue so sendFinalReply still runs.
+        if (controls.profileConfig.agentKind === 'codex') {
+          log.fail('stream', err, { mode: replyMode, step: 'progress-stream' });
+        } else {
+          log.warn('stream', 'final-reply-after-stream-error', { mode: replyMode });
+        }
       }
       await recallIfEmptyStreamedReply(channel, progress, filterForPrefs(latestState), scope);
-      if (controls.profileConfig.agentKind === 'codex') {
+      // The final answer always goes out as its own message. For claude this
+      // is the only delivery path; for codex/mimo it carries the final_text
+      // the stream never showed. Only skip when the stream never opened or was
+      // abandoned — then the fallback above already sent it.
+      if (isCodexLike) {
         await sendFinalReply({
           channel,
           chatId,
           scope,
           state: finalReplyState(progress, filterForPrefs(latestState)),
+          replyMode,
+          sendOpts,
+          cardRenderOptions,
+        });
+      } else if (progress.opened() && !progress.abandoned()) {
+        await sendFinalReply({
+          channel,
+          chatId,
+          scope,
+          state: finalAnswerOnlyState(filterForPrefs(latestState)),
           replyMode,
           sendOpts,
           cardRenderOptions,
@@ -1361,9 +1413,12 @@ function createLazyProgressStream(
  * with `renderText` in both reply modes so it matches the rule
  * `recallIfEmptyStreamedReply` applies: a stream we open is one that survives.
  */
-function shouldOpenProgressStream(state: RunState): boolean {
+function shouldOpenProgressStream(
+  state: RunState,
+  render: (s: RunState) => string = renderText,
+): boolean {
   if (state.terminal !== 'running') return false;
-  return renderText({ ...state, footer: null }).trim() !== '';
+  return render({ ...state, footer: null }).trim() !== '';
 }
 
 /**

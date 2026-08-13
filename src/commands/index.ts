@@ -729,7 +729,8 @@ function consumeResumeCandidate(
     candidate.cwdRealpath !== identity.cwdRealpath ||
     candidate.policyFingerprint !== identity.policyFingerprint ||
     (identity.agentId === 'claude' && !candidate.sessionId) ||
-    (identity.agentId === 'codex' && !candidate.threadId)
+    (identity.agentId === 'codex' && !candidate.threadId) ||
+    (identity.agentId === 'mimo' && !candidate.sessionId)
   ) {
     return undefined;
   }
@@ -1159,7 +1160,9 @@ async function handleDoctor(args: string, ctx: CommandContext): Promise<void> {
   const capability =
     ctx.controls.profileConfig.agentKind === 'codex'
       ? codexCapability(ctx.controls.profileConfig)
-      : claudeCapability(ctx.controls.profileConfig);
+      : ctx.controls.profileConfig.agentKind === 'mimo'
+        ? mimoCapability(ctx.controls.profileConfig)
+        : claudeCapability(ctx.controls.profileConfig);
   const policy = evaluateRunPolicy({
     scope: {
       source: 'im',
