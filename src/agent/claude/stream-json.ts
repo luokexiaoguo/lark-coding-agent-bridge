@@ -98,10 +98,6 @@ export function createTranslateEvent(): ClaudeEventTranslator {
         const delta = evt.event.delta;
         if (delta?.type === 'text_delta' && delta.text) {
           streamingText = true;
-          // The delta itself is the streamed text; a later assistant block with
-          // the same content must not be re-emitted. Track the accumulated
-          // delta text so tool_use/assistant knows what was already shown.
-          
           events.push({ type: 'text', delta: delta.text });
         } else if (delta?.type === 'thinking_delta' && delta.thinking) {
           events.push({ type: 'thinking', delta: delta.thinking });
@@ -144,7 +140,9 @@ export function createTranslateEvent(): ClaudeEventTranslator {
               flushPending(events, false);
             }
             streamingText = false;
-            
+            // A new turn starts after a tool call: any prior final-answer
+            // candidate is stale (a later block may carry the real conclusion).
+            finalCandidate = undefined;
             events.push({
               type: 'tool_use',
               id: block.id,
