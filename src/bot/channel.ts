@@ -1221,6 +1221,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       const progressRender = renderText;
       let latestState: RunState = initialState;
       let producerStarted = false;
+      let lastStreamedText = '';
       let markdownCtrl: { setContent(markdown: string): Promise<void> } | undefined;
       const progress = createLazyProgressStream(scope, replyMode, () =>
         channel.stream(
@@ -1247,7 +1248,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           latestState = state;
           if (shouldOpenProgressStream(filterForPrefs(state), progressRender)) progress.ensureOpen();
           if (markdownCtrl) {
-            await markdownCtrl.setContent(progressRender(filterForPrefs(state)));
+            lastStreamedText = progressRender(filterForPrefs(state));
+            await markdownCtrl.setContent(lastStreamedText);
           }
         },
       );
@@ -1272,20 +1274,36 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         }
       }
       await recallIfEmptyStreamedReply(channel, progress, filterForPrefs(latestState), scope);
-      // The final answer always goes out as its own message. For all agents
-      // (claude included, now that its adapter emits final_text) this carries
-      // the final_text the stream never showed — independent of stream update
-      // health. Only skip when the stream never opened or was abandoned (then
-      // the fallback above already sent it).
-      await sendFinalReply({
-        channel,
-        chatId,
-        scope,
-        state: finalReplyState(progress, filterForPrefs(latestState)),
-        replyMode,
-        sendOpts,
-        cardRenderOptions,
-      });
+      // The final answer goes out as its own message — unless the progress
+      // stream already carried it. For mimo (and codex) the adapter accumulates
+      // every text block, so the final_text duplicates what the stream just
+      // rendered; skip the standalone reply in that case to avoid posting the
+      // same conclusion twice. If the stream never showed the text (it failed
+      // or was abandoned), lastStreamedText won't contain it and we still send.
+      const finalState = filterForPrefs(latestState);
+      const finalReply = finalReplyState(progress, finalState);
+      const finalReplyText = renderText(finalReply).trim();
+      if (
+        finalReplyText &&
+        lastStreamedText &&
+        lastStreamedText.includes(finalReplyText)
+      ) {
+        log.info('outbound', 'final-reply-skipped', {
+          scope,
+          reason: 'already-streamed',
+          mode: replyMode,
+        });
+      } else {
+        await sendFinalReply({
+          channel,
+          chatId,
+          scope,
+          state: finalReply,
+          replyMode,
+          sendOpts,
+          cardRenderOptions,
+        });
+      }
     } else {
       // text mode: drain the agent stream without sending anything during
       // the run, then post the final rendered text once as a plain markdown

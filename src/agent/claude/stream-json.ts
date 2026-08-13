@@ -43,10 +43,15 @@ export interface ClaudeEventTranslator {
  *
  * Claude emits each assistant turn as one event whose text block is the full
  * reply for that turn. Mid-run turns are progress commentary; the final turn
- * (the one just before `result`) is the answer. We buffer text so that when
- * `result` arrives we know the last text block is the conclusion and emit it
- * as `final_text` — mirroring codex/mimo — while everything before it streams
- * as regular `text` (progress the user can read while tools run).
+ * (the one just before `result`) is the answer. We buffer the most recent
+ * text so that when `result` arrives we know the last text block is the
+ * conclusion and emit it as `final_text` — mirroring codex/mimo — while
+ * everything before it streams as regular `text` (progress the user can read
+ * while tools run).
+ *
+ * A single assistant message may carry several text blocks; we join them so
+ * none is dropped. Mid-run commentary is flushed as `text` the moment a tool
+ * call appears in a later turn (a tool call ends the commentary turn).
  */
 export function createTranslateEvent(): ClaudeEventTranslator {
   let pendingText: string | undefined;
@@ -86,7 +91,9 @@ export function createTranslateEvent(): ClaudeEventTranslator {
             if (sawToolUse && pendingText !== undefined) {
               flushPending(events, false);
             }
-            pendingText = block.text;
+            // Join consecutive text blocks instead of overwriting, so a single
+            // assistant message with several text blocks loses nothing.
+            pendingText = pendingText === undefined ? block.text : `${pendingText}${block.text}`;
           } else if (
             block.type === 'thinking' &&
             typeof block.thinking === 'string' &&

@@ -509,6 +509,44 @@ describe('markdown stream startup failures', () => {
       ),
     ).toBe(true);
   });
+
+  it('mimo: skips the standalone reply when the stream already showed the final text', async () => {
+    // mimo accumulates every text block into final_text (textParts.join);
+    // the progress stream renders the same accumulated text. Sending it again
+    // as a standalone reply would duplicate it — dedup must skip the second
+    // copy while keeping the single streamed message.
+    const visibleProgress: string[] = [];
+    const h = await createHarness({
+      agentKind: 'mimo',
+      events: [
+        { type: 'text', delta: '过程文本' },
+        { type: 'text', delta: '最终答案' },
+        // Real mimo emits final_text = join of all text parts.
+        { type: 'final_text', content: '过程文本最终答案' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        await producer?.({
+          setContent: vi.fn(async (markdown: string) => {
+            visibleProgress.push(markdown);
+          }),
+        });
+      },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_mimo_dedup', 'run'));
+    // The progress stream rendered the full accumulated text, so no standalone
+    // reply is posted (dedup).
+    await waitFor(() => visibleProgress.some((m) => m.includes('最终答案')));
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    expect(visibleProgress.some((m) => m.includes('过程文本最终答案'))).toBe(true);
+    expect(h.channel.sent).toHaveLength(0);
+  });
 });
 
 async function createHarness(options: {
