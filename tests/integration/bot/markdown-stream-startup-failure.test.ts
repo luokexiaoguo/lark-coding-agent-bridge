@@ -36,7 +36,8 @@ interface MessageHandlerMap {
 interface FakeLarkChannel {
   botIdentity: { openId: string; name: string };
   handlers: MessageHandlerMap;
-  sent: Array<{ chatId: string; content: unknown; options?: unknown }>;
+  sent: Array<{ chatId: string; content: unknown; options?: unknown; messageId?: string }>;
+  recallMessage: ReturnType<typeof vi.fn>;
   rawClient: {
     request: ReturnType<typeof vi.fn>;
     application: {
@@ -97,7 +98,7 @@ describe('markdown stream startup failures', () => {
         path: { message_id: 'om_first', reaction_id: 'reaction_1' },
       }),
     );
-    expect(lastMarkdown(h.channel)).toContain('agent 失败');
+    expect(lastMarkdown(h.channel)).toContain("agent 失败");
     expect(lastMarkdown(h.channel)).toContain('codex exited with code 1');
   });
 
@@ -114,7 +115,7 @@ describe('markdown stream startup failures', () => {
     await h.channel.handlers.message?.(message('om_second', 'second'));
     await waitFor(() => h.agent.runOptions.length === 2, 1000);
 
-    expect(lastMarkdown(h.channel)).toContain('agent 失败');
+    expect(lastMarkdown(h.channel)).toContain("agent 失败");
 
     reaction.resolve({ data: { reaction_id: 'reaction_1' } });
     await waitFor(() => h.channel.rawClient.im.v1.messageReaction.delete.mock.calls.length > 0);
@@ -691,6 +692,7 @@ function createFakeLarkChannel(harnessOptions: {
 } = {}): FakeLarkChannel {
   const handlers: MessageHandlerMap = {};
   const sent: FakeLarkChannel['sent'] = [];
+  let sentSeq = 0;
   const channel: FakeLarkChannel = {
     handlers,
     sent,
@@ -730,10 +732,18 @@ function createFakeLarkChannel(harnessOptions: {
       return { state: 'connected', reconnectAttempts: 0 };
     },
     async send(chatId, content, options) {
-      sent.push({ chatId, content, options });
+      const messageId = `sent_${++sentSeq}`;
+      sent.push({ chatId, content, options, messageId });
       if (harnessOptions.send) return harnessOptions.send(chatId, content, options);
-      return { messageId: `sent_${sent.length}` };
+      return { messageId };
     },
+    // Mimic the real SDK: recall removes the message, so assertions on sent
+    // see only surviving messages (ack placeholders get recalled on the first
+    // visible agent event or at run end).
+    recallMessage: vi.fn(async (messageId: string) => {
+      const idx = sent.findIndex((s) => s.messageId === messageId);
+      if (idx !== -1) sent.splice(idx, 1);
+    }),
     stream: harnessOptions.stream ?? (async () => {
       await new Promise<void>(() => {});
     }),
@@ -797,7 +807,11 @@ function message(messageId: string, content: string): NormalizedMessage {
 }
 
 function lastMarkdown(channel: FakeLarkChannel): string {
-  const content = channel.sent.at(-1)?.content as { markdown?: string } | undefined;
+  // Skip the ack placeholder ("正在思考…") — tests assert on real replies.
+  const content = [...channel.sent]
+    .reverse()
+    .map((s) => s.content as { markdown?: string } | undefined)
+    .find((c) => c?.markdown && !c.markdown.includes('正在思考… 请稍候'));
   expect(content?.markdown).toBeTypeOf('string');
   return content?.markdown ?? '';
 }

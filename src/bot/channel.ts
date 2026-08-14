@@ -996,7 +996,16 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const { execution, cwdRealpath: cwd } = flow;
   activePolicyFingerprints.set(scope, flow.policy.policyFingerprint);
   const handle = execution.handle;
-  const eventStream = execution.subscribe();
+  // Post an instant "thinking…" placeholder reply so the Feishu side gets
+  // immediate feedback while the model produces its first token (long resumed
+  // sessions can sit quiet for 30-50s). It is recalled as soon as the first
+  // visible agent event (tool call / text / final answer) arrives, so the real
+  // output takes its place. Failures are non-fatal and never block the run.
+  const ackPlaceholder = postAckPlaceholder(channel, chatId, sendOpts);
+  let eventStream = execution.subscribe();
+  if (ackPlaceholder) {
+    eventStream = wrapWithAckRecall(eventStream, ackPlaceholder, scope);
+  }
   if (flow.resumeFrom) {
     log.info('session', 'resume', { sessionId: flow.resumeFrom, cwd });
   } else {
@@ -1350,6 +1359,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     log.fail('stream', err);
   } finally {
     activePolicyFingerprints.delete(scope);
+    // Always recall the ack placeholder at run end: if no visible event ever
+    // fired (empty/failed run) it would otherwise linger as a stuck
+    // "正在思考…". recall is idempotent, so a first-event recall is safe here.
+    if (ackPlaceholder) void ackPlaceholder.recall();
     scheduleWorkingReactionCleanup(channel, lastMsg.messageId, reactionPromise);
   }
 }
@@ -2039,4 +2052,76 @@ function parseJsonOrRaw(input: string): unknown {
 
 function isDefined<T>(value: T | undefined): value is T {
   return value !== undefined;
+}
+
+/**
+ * Instant "thinking…" placeholder reply, recalled as soon as the agent emits
+ * its first visible event (tool call / text / final answer). Gives the Feishu
+ * side immediate feedback while the model is still producing its first token
+ * (long resumed sessions can sit quiet for 30-50s). All failures are
+ * non-fatal: a leftover placeholder is harmless and never blocks the run.
+ */
+function postAckPlaceholder(
+  channel: LarkChannel,
+  chatId: string,
+  sendOpts: { replyTo: string; replyInThread?: boolean },
+): { recall: () => Promise<void> } | undefined {
+  // recall awaits the send so a fast first event still recalls the placeholder
+  // even if the send hadn't completed yet. Idempotent: only recalls once.
+  let recalled = false;
+  let resolveSettled!: (v: { messageId?: string }) => void;
+  const sent = new Promise<{ messageId?: string }>((resolve) => {
+    resolveSettled = resolve;
+  });
+  void channel
+    .send(chatId, { markdown: '_⏳ 正在思考… 请稍候_' }, sendOpts)
+    .then((result) => resolveSettled({ messageId: result.messageId }))
+    .catch((err) => {
+      log.warn('outbound', 'ack-placeholder-failed', {
+        err: err instanceof Error ? err.message : String(err),
+      });
+      resolveSettled({});
+    });
+  const recall = async (): Promise<void> => {
+    const { messageId } = await sent;
+    if (!messageId || recalled) return;
+    recalled = true;
+    try {
+      await channel.recallMessage(messageId);
+      log.info('outbound', 'ack-recall', { messageId });
+    } catch (err) {
+      log.warn('outbound', 'ack-recall-failed', {
+        messageId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+  return { recall };
+}
+
+/**
+ * Wrap the agent event stream so the placeholder is recalled on the first
+ * visible event. The wrapper is transparent: events pass through unchanged.
+ */
+function wrapWithAckRecall(
+  events: AsyncIterable<AgentEvent>,
+  ack: { recall: () => Promise<void> },
+  scope: string,
+): AsyncIterable<AgentEvent> {
+  let recalled = false;
+  return {
+    async *[Symbol.asyncIterator](): AsyncIterator<AgentEvent> {
+      for await (const evt of events) {
+        if (
+          !recalled &&
+          (evt.type === 'tool_use' || evt.type === 'text' || evt.type === 'final_text')
+        ) {
+          recalled = true;
+          log.info('outbound', 'ack-recalled-on', { scope, event: evt.type });
+          void ack.recall();
+        }
+        yield evt;
+      }
+    },
+  };
 }
